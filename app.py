@@ -1,135 +1,93 @@
-import os, json, base64, sqlite3, datetime
 from flask import Flask, request, jsonify
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+import sqlite3
+import hashlib
+import os
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-DB_FILE = "licenses.db"
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-PRIVATE_KEY_PATH = "private.pem"
-
-def db():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+DB_NAME = "licenses.db"
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set in Render environment
 
 def init_db():
-    conn = db()
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS LICENSES (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        license_key TEXT UNIQUE,
-        max_ativacoes INTEGER,
-        ativacoes_usadas INTEGER DEFAULT 0,
-        ativo INTEGER DEFAULT 1
-    )
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS ACTIVATIONS (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        license_key TEXT,
-        hwid TEXT,
-        data TEXT,
-        ip TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def get_private_key():
-    if not os.path.exists(PRIVATE_KEY_PATH):
-        raise RuntimeError("private.pem não encontrado. Gere as chaves primeiro.")
-    with open(PRIVATE_KEY_PATH, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None)
-
-def assinar(payload: str) -> str:
-    private_key = get_private_key()
-    assinatura = private_key.sign(
-        payload.encode("utf-8"),
-        padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    return base64.b64encode(assinatura).decode("utf-8")
-
-@app.route("/activate", methods=["POST"])
-def activate():
-    dados = request.get_json(force=True)
-    license_key = dados.get("license_key", "").strip()
-    hwid = dados.get("hwid", "").strip()
-
-    conn = db()
-    c = conn.cursor()
-    c.execute("SELECT max_ativacoes, ativacoes_usadas, ativo FROM LICENSES WHERE license_key = ?", (license_key,))
-    row = c.fetchone()
-
-    if not row:
-        return jsonify({"erro": "Licença inexistente"}), 404
-
-    max_ativ, used, ativo = row
-
-    if ativo == 0:
-        return jsonify({"erro": "Licença revogada"}), 403
-
-    if used >= max_ativ:
-        return jsonify({"erro": "Limite de ativações excedido"}), 403
-
-    c.execute(
-        "INSERT INTO ACTIVATIONS (license_key, hwid, data, ip) VALUES (?, ?, ?, ?)",
-        (license_key, hwid, datetime.datetime.utcnow().isoformat() + "Z", request.remote_addr)
-    )
-    c.execute("UPDATE LICENSES SET ativacoes_usadas = ativacoes_usadas + 1 WHERE license_key = ?", (license_key,))
-    conn.commit()
-    conn.close()
-
-    payload = {
-        "license_key": license_key,
-        "hwid": hwid,
-        "issued": datetime.datetime.utcnow().isoformat() + "Z"
-    }
-    signature = assinar(json.dumps(payload, separators=(',',':')))
-    return jsonify({"payload": payload, "signature": signature})
-
-@app.route("/verify", methods=["POST"])
-def verify():
-    dados = request.get_json(force=True)
-    lic = dados.get("license_key", "").strip()
-
-    conn = db()
-    c = conn.cursor()
-    c.execute("SELECT ativo FROM LICENSES WHERE license_key = ?", (lic,))
-    row = c.fetchone()
-    conn.close()
-
-    if not row:
-        return jsonify({"valid": False})
-
-    return jsonify({"valid": row[0] == 1})
-
-@app.route("/admin/add_license", methods=["POST"])
-def admin_add_license():
-    token = request.headers.get("X-Admin-Token", "")
-    if token != ADMIN_TOKEN:
-        return jsonify({"erro": "não autorizado"}), 401
-
-    dados = request.get_json(force=True)
-    license_key = dados.get("license_key", "").strip()
-    max_ativacoes = int(dados.get("max_ativacoes", 1))
-
-    conn = db()
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT INTO LICENSES (license_key, max_ativacoes) VALUES (?, ?)",
-            (license_key, max_ativacoes)
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT UNIQUE,
+            machine_id TEXT,
+            valid_until TEXT,
+            created_at TEXT
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        return jsonify({"erro": "license_key já existe"}), 409
-
+    """)
+    conn.commit()
     conn.close()
-    return jsonify({"ok": True, "license_key": license_key})
+
+init_db()
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    token = request.headers.get("Authorization")
+    if token != ADMIN_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    machine = data.get("machine")
+    days = data.get("days", 30)
+
+    if not machine:
+        return jsonify({"error": "Missing machine ID"}), 400
+
+    raw = machine + str(datetime.utcnow().timestamp())
+    license_key = hashlib.sha256(raw.encode()).hexdigest()
+    valid_until = datetime.utcnow() + timedelta(days=days)
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO licenses (license_key, machine_id, valid_until, created_at) VALUES (?, ?, ?, ?)",
+        (license_key, machine, valid_until.isoformat(), datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "license": license_key,
+        "machine": machine,
+        "valid_until": valid_until.isoformat()
+    })
+
+@app.route("/check", methods=["GET"])
+def check():
+    license_key = request.args.get("license")
+    machine = request.args.get("machine")
+
+    if not license_key or not machine:
+        return jsonify({"valid": False, "reason": "Missing parameters"}), 400
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT machine_id, valid_until FROM licenses WHERE license_key = ?", (license_key,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"valid": False, "reason": "License not found"}), 404
+
+    db_machine, valid_until = row
+
+    if db_machine != machine:
+        return jsonify({"valid": False, "reason": "Machine mismatch"}), 403
+
+    if datetime.fromisoformat(valid_until) < datetime.utcnow():
+        return jsonify({"valid": False, "reason": "Expired"}), 403
+
+    return jsonify({"valid": True})
 
 if __name__ == "__main__":
-    init_db()
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
